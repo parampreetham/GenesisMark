@@ -12,3 +12,5 @@ backend/uploads/
 
 # OS files
 .DS_Store
+
+backend/.env

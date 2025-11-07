@@ -5,10 +5,13 @@ import path from 'path';
 import fs from 'fs'; // <-- Add this import
 import { calculateSHA256, calculatePHash } from './src/hashUtils.js'; // <-- Add this import
 import { execa } from 'execa';
+import 'dotenv/config'; // Loads .env file immediately
+import pinataSDK from '@pinata/sdk';
 
 // --- Basic Setup ---
 const app = express();
 const PORT = process.env.PORT || 3001;
+const pinata = new pinataSDK(process.env.PINATA_API_KEY, process.env.PINATA_API_SECRET);
 
 // --- Middleware ---
 app.use(cors()); 
@@ -43,49 +46,60 @@ app.post('/api/upload', upload.single('file'), async (req, res) => {
   }
 
   const filePath = req.file.path;
-
+  const originalFilename = req.file.originalname;
+  
   try {
-    // --- 2. ADD WATERMARKING STEP ---
-    // This calls our Python script and waits for it to finish.
-    // It modifies the file at 'filePath' in place.
+    // --- Phase 3: Watermarking ---
     const watermarkText = `GenesisMark - ${new Date().toISOString()}`;
     try {
-      // Use 'python3' if 'python' doesn't work on your system
       await execa('python', ['src/watermark.py', filePath, watermarkText]); 
-      console.log(`Watermarking complete for ${req.file.filename}`);
+      console.log(`Watermarking complete for ${originalFilename}`);
     } catch (pyError) {
       console.error("Python script error:", pyError.stderr || pyError.message);
       throw new Error('Failed to apply watermark.');
     }
-    // --- END WATERMARKING STEP ---
-
-
-    // 1. Generate hashes (this now runs on the *watermarked* file)
+    
+    // --- Phase 2: Hashing (on watermarked file) ---
     const [sha256Hash, pHash] = await Promise.all([
       calculateSHA256(filePath),
       calculatePHash(filePath)
     ]);
+    console.log(`Hashes complete: SHA-256: ${sha256Hash}, pHash: ${pHash}`);
 
-    console.log(`File received: ${req.file.filename}`);
-    console.log(`SHA-256 (of watermarked file): ${sha256Hash}`);
-    console.log(`pHash (of watermarked file): ${pHash}`);
+    // --- 3. NEW: Phase 4: Pin to IPFS ---
+    console.log('Pinning to IPFS...');
+    const stream = fs.createReadStream(filePath);
+    const options = {
+      pinataMetadata: {
+        name: originalFilename,
+        keyvalues: {
+          sha256: sha256Hash,
+          pHash: pHash
+        }
+      },
+    };
+    const ipfsResult = await pinata.pinFileToIPFS(stream, options);
+    const ipfsCid = ipfsResult.IpfsHash;
+    console.log(`IPFS Pin complete! CID: ${ipfsCid}`);
 
-    // TODO: Phase 4 (IPFS)
-    // TODO: Phase 5 (Save to DB/Blockchain)
+    // --- Phase 5 (TODO: Save to DB/Blockchain) ---
+    // Now you have all the data: sha256Hash, pHash, and ipfsCid
 
     // Send back the results
     res.json({
-      message: 'File watermarked and processed successfully.',
-      filename: req.file.filename,
+      message: 'File watermarked, processed, and pinned to IPFS.',
+      filename: originalFilename,
       sha256: sha256Hash,
       pHash: pHash,
+      ipfsCid: ipfsCid, // <-- NEW DATA
+      timestamp: ipfsResult.Timestamp
     });
 
   } catch (error) {
-    console.error('Error processing file:', error);
+    console.error('Error processing file:', error.message);
     res.status(500).json({ error: 'Error processing file.' });
   } finally {
-    // Clean up: Delete the temporary file from /uploads
+    // 4. Clean up: Delete the temporary file
     fs.unlink(filePath, (err) => {
       if (err) console.error("Error deleting temp file:", err);
     });
