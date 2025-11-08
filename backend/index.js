@@ -2,18 +2,31 @@ import express from 'express';
 import cors from 'cors';
 import multer from 'multer';
 import path from 'path';
-import fs from 'fs'; // <-- Add this import
-import { calculateSHA256, calculatePHash } from './src/hashUtils.js'; // <-- Add this import
+import fs from 'fs';
+import 'dotenv/config';
 import { execa } from 'execa';
-import 'dotenv/config'; // Loads .env file immediately
 import pinataSDK from '@pinata/sdk';
+import { calculateSHA256, calculatePHash } from './src/hashUtils.js';
 
-// --- Basic Setup ---
-const app = express();
-const PORT = process.env.PORT || 3001;
+// --- ETHERS IMPORTS ---
+import { ethers } from 'ethers';
+import abi from './src/GenesisRegistry.json' with { type: 'json' };
+
+// --- Pinata Setup ---
 const pinata = new pinataSDK(process.env.PINATA_API_KEY, process.env.PINATA_API_SECRET);
 
+// --- ETHERS CONTRACT SETUP ---
+const CONTRACT_ADDRESS = "0x5FbDB2315678afecb367f032d93F642f64180aa3";
+const LOCALHOST_RPC_URL = "http://127.0.0.1:8545/";
+
+const provider = new ethers.JsonRpcProvider(LOCALHOST_RPC_URL);
+const signer = await provider.getSigner(0);
+const genesisContract = new ethers.Contract(CONTRACT_ADDRESS, abi.abi, signer);
+console.log(`✅ Connected to local blockchain. Contract loaded at ${CONTRACT_ADDRESS}`);
+
 // --- Middleware ---
+const app = express();
+const PORT = process.env.PORT || 3001;
 app.use(cors()); 
 app.use(express.json());
 
@@ -26,21 +39,12 @@ const storage = multer.diskStorage({
     cb(null, Date.now() + '-' + file.originalname);
   }
 });
-
 const upload = multer({ storage: storage });
 
 // --- API Endpoints ---
-
-app.get('/api', (req, res) => {
-  res.json({ message: 'GenesisMark API is running!' });
-});
-
-/**
- * @route   POST /api/upload
- * @desc    Uploads a file, WATERMARKS it, generates hashes, and (later) registers it
- * @access  Public
- */
 app.post('/api/upload', upload.single('file'), async (req, res) => {
+  // ... (This route is complete and working)
+  
   if (!req.file) {
     return res.status(400).json({ error: 'No file uploaded.' });
   }
@@ -49,49 +53,36 @@ app.post('/api/upload', upload.single('file'), async (req, res) => {
   const originalFilename = req.file.originalname;
   
   try {
-    // --- Phase 3: Watermarking ---
     const watermarkText = `GenesisMark - ${new Date().toISOString()}`;
-    try {
-      await execa('python', ['src/watermark.py', filePath, watermarkText]); 
-      console.log(`Watermarking complete for ${originalFilename}`);
-    } catch (pyError) {
-      console.error("Python script error:", pyError.stderr || pyError.message);
-      throw new Error('Failed to apply watermark.');
-    }
+    await execa('python', ['src/watermark.py', filePath, watermarkText]); 
+    console.log(`Watermarking complete for ${originalFilename}`);
     
-    // --- Phase 2: Hashing (on watermarked file) ---
     const [sha256Hash, pHash] = await Promise.all([
       calculateSHA256(filePath),
       calculatePHash(filePath)
     ]);
     console.log(`Hashes complete: SHA-256: ${sha256Hash}, pHash: ${pHash}`);
 
-    // --- 3. NEW: Phase 4: Pin to IPFS ---
     console.log('Pinning to IPFS...');
     const stream = fs.createReadStream(filePath);
     const options = {
-      pinataMetadata: {
-        name: originalFilename,
-        keyvalues: {
-          sha256: sha256Hash,
-          pHash: pHash
-        }
-      },
+      pinataMetadata: { name: originalFilename, keyvalues: { sha256: sha256Hash, pHash: pHash } },
     };
     const ipfsResult = await pinata.pinFileToIPFS(stream, options);
     const ipfsCid = ipfsResult.IpfsHash;
     console.log(`IPFS Pin complete! CID: ${ipfsCid}`);
 
-    // --- Phase 5 (TODO: Save to DB/Blockchain) ---
-    // Now you have all the data: sha256Hash, pHash, and ipfsCid
+    console.log("Registering record on blockchain...");
+    const tx = await genesisContract.createRecord(sha256Hash, pHash, ipfsCid);
+    const receipt = await tx.wait();
+    console.log(`✅ Record created! Transaction hash: ${receipt.hash}`);
 
-    // Send back the results
     res.json({
-      message: 'File watermarked, processed, and pinned to IPFS.',
+      message: 'File watermarked, processed, pinned to IPFS, and registered on-chain.',
       filename: originalFilename,
       sha256: sha256Hash,
       pHash: pHash,
-      ipfsCid: ipfsCid, // <-- NEW DATA
+      ipfsCid: ipfsCid,
       timestamp: ipfsResult.Timestamp
     });
 
@@ -99,59 +90,71 @@ app.post('/api/upload', upload.single('file'), async (req, res) => {
     console.error('Error processing file:', error.message);
     res.status(500).json({ error: 'Error processing file.' });
   } finally {
-    // 4. Clean up: Delete the temporary file
     fs.unlink(filePath, (err) => {
       if (err) console.error("Error deleting temp file:", err);
     });
   }
 });
 
-/**
- * @route   POST /api/verify
- * @desc    Uploads a file and generates its hashes for verification
- * @access  Public
- */
-app.post('/api/verify', upload.single('file'), async (req, res) => { // <-- Make this async
+// --- UPDATED VERIFICATION ENDPOINT ---
+app.post('/api/verify', upload.single('file'), async (req, res) => {
   if (!req.file) {
     return res.status(400).json({ error: 'No file uploaded for verification.' });
   }
-
+  
   const filePath = req.file.path;
-
+  
   try {
-    // 1. Generate both hashes in parallel
-    const [sha256Hash, pHash] = await Promise.all([
-      calculateSHA256(filePath),
-      calculatePHash(filePath)
-    ]);
+    // 1. Calculate the SHA-256 hash of the uploaded file
+    const sha256Hash = await calculateSHA256(filePath);
+    console.log(`Verification check for SHA-256: ${sha256Hash}`);
 
-    console.log(`File for verification received: ${req.file.filename}`);
-    console.log(`SHA-256: ${sha256Hash}`);
-    console.log(`pHash: ${pHash}`);
+    // 2. Call the 'getRecord' function from our smart contract
+    // This is a 'read' operation and doesn't cost any gas
+    const record = await genesisContract.getRecord(sha256Hash);
 
-    // In future steps, you will use these hashes to:
-    // 1. Check DB for SHA-256 match (exact file)
-    // 2. Check DB for pHash match (similar file)
+    // 3. Check if the record exists
+    // The 'creator' field will be a non-zero address if it exists
+    const zeroAddress = "0x0000000000000000000000000000000000000000";
+    const isAuthentic = record.creator !== zeroAddress;
 
-    res.json({
-      message: 'Verification check complete.',
-      sha256: sha256Hash,
-      pHash: pHash,
-      isAuthentic: 'not_implemented', // We'll build this in a later phase
-      isSimilar: 'not_implemented'
-    });
+    if (isAuthentic) {
+      console.log("✅ VERIFIED: Record found on-chain.");
+      res.json({
+        message: 'File is authentic and verified on-chain.',
+        isAuthentic: true,
+        record: {
+          sha256: record.sha256Hash,
+          pHash: record.pHash,
+          ipfsCid: record.ipfsCid,
+          creator: record.creator,
+          // Convert BigInt to string for JSON serialization
+          timestamp: record.timestamp.toString(), 
+        }
+      });
+    } else {
+      console.log("❌ NOT VERIFIED: No record found for this hash.");
+      res.json({
+        message: 'File not found. This content has not been registered.',
+        isAuthentic: false,
+        sha256: sha256Hash,
+      });
+    }
 
   } catch (error) {
     console.error('Error processing verification file:', error);
     res.status(500).json({ error: 'Error processing verification file.' });
   } finally {
-    // 2. Clean up: Delete the temporary file
     fs.unlink(filePath, (err) => {
       if (err) console.error("Error deleting temp file:", err);
     });
   }
 });
 
+// Simple health check route
+app.get('/api', (req, res) => {
+  res.json({ message: 'GenesisMark API is running!' });
+});
 
 // --- Server Startup ---
 app.listen(PORT, () => {
