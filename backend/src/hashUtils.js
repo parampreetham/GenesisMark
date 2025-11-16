@@ -38,8 +38,9 @@ export const calculatePHash = async (filePath) => {
     return image.hash(); 
   } catch (err) {
     console.error("pHash Error:", err.message);
-    if (err.message.includes('Could not find MIME for Buffer')) {
-      return 'not_an_image';
+    if (err.message.includes('Could not find MIME for Buffer') || 
+        err.message.includes('image/webp')) {
+      return 'unsupported_image_format'; // Return a specific string
     }
     throw err;
   }

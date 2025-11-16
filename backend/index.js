@@ -12,11 +12,14 @@ import { calculateSHA256, calculatePHash } from './src/hashUtils.js';
 import { ethers } from 'ethers';
 import abi from './src/GenesisRegistry.json' with { type: 'json' };
 
+import authRouter from './authRoutes.js';
+import authMiddleware from './src/authMiddleware.js';
+
 // --- Pinata Setup ---
 const pinata = new pinataSDK(process.env.PINATA_API_KEY, process.env.PINATA_API_SECRET);
 
 // --- ETHERS CONTRACT SETUP ---
-const CONTRACT_ADDRESS = "0x5FbDB2315678afecb367f032d93F642f64180aa3";
+const CONTRACT_ADDRESS = "0xe7f1725E7734CE288F8367e1Bb143E90bb3F0512";
 const LOCALHOST_RPC_URL = "http://127.0.0.1:8545/";
 
 const provider = new ethers.JsonRpcProvider(LOCALHOST_RPC_URL);
@@ -29,6 +32,7 @@ const app = express();
 const PORT = process.env.PORT || 3001;
 app.use(cors()); 
 app.use(express.json());
+app.use('/api/auth', authRouter);
 
 // --- Multer Configuration ---
 const storage = multer.diskStorage({
@@ -42,7 +46,7 @@ const storage = multer.diskStorage({
 const upload = multer({ storage: storage });
 
 // --- API Endpoints ---
-app.post('/api/upload', upload.single('file'), async (req, res) => {
+app.post('/api/upload',authMiddleware, upload.single('file'), async (req, res) => {
   // ... (This route is complete and working)
   
   if (!req.file) {
@@ -76,6 +80,7 @@ app.post('/api/upload', upload.single('file'), async (req, res) => {
     const tx = await genesisContract.createRecord(sha256Hash, pHash, ipfsCid);
     const receipt = await tx.wait();
     console.log(`✅ Record created! Transaction hash: ${receipt.hash}`);
+    console.log(`Upload request from user: ${req.user.email}`);
 
     res.json({
       message: 'File watermarked, processed, pinned to IPFS, and registered on-chain.',
@@ -97,7 +102,7 @@ app.post('/api/upload', upload.single('file'), async (req, res) => {
 });
 
 // --- UPDATED VERIFICATION ENDPOINT ---
-app.post('/api/verify', upload.single('file'), async (req, res) => {
+app.post('/api/verify',authMiddleware, upload.single('file'), async (req, res) => {
   if (!req.file) {
     return res.status(400).json({ error: 'No file uploaded for verification.' });
   }
@@ -120,6 +125,7 @@ app.post('/api/verify', upload.single('file'), async (req, res) => {
 
     if (isAuthentic) {
       console.log("✅ VERIFIED: Record found on-chain.");
+      console.log(`Verify request from user: ${req.user.email}`);
       res.json({
         message: 'File is authentic and verified on-chain.',
         isAuthentic: true,
